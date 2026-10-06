@@ -30,6 +30,20 @@ class Segment(Base):
     )
 
 
+class ReassignmentBatch(Base):
+    """跨司机值勤调整批次：整批成功提交后固化请求指纹与响应，供同批次号幂等重试。
+
+    仅在整批成功后落库；校验失败（整批拒绝）不留记录，批次号不被占用。
+    """
+
+    __tablename__ = "reassignment_batches"
+
+    batch_id = Column(String(64), primary_key=True)
+    request_hash = Column(String(64), nullable=False)  # 规范化请求内容的 SHA-256
+    response = Column(JSONType, nullable=True)  # 提交时固化的响应（与调整同事务写入，提交即非空）
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class AuditSnapshot(Base):
     """审核发布快照：固化发布时刻的输入修订与合规结论，之后更正不影响旧版。"""
 

@@ -91,6 +91,66 @@ class ComplianceOut(BaseModel):
     violations: list[ViolationOut]
 
 
+class ComplianceResult(BaseModel):
+    compliant: bool
+    violations: list[ViolationOut]
+
+
+class ReassignmentItem(BaseModel):
+    """批次内单条片段的调整指令：目标司机、起止时间与类型均为必填（调整后的完整终态）。"""
+
+    segment_id: str = Field(min_length=1, max_length=64)
+    expected_revision: int = Field(ge=1)
+    driver_id: str = Field(min_length=1, max_length=64)
+    start_utc: datetime
+    end_utc: datetime
+    type: SegmentType
+
+    @field_validator("start_utc", "end_utc")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        return _aware_utc(v)
+
+    @model_validator(mode="after")
+    def _positive_duration(self):
+        if self.end_utc <= self.start_utc:
+            raise ValueError("end_utc 必须晚于 start_utc（拒绝非正时长片段）")
+        return self
+
+
+class ReassignmentRequest(BaseModel):
+    """一批已有片段的跨司机调整：作为一次操作提交，整批原子生效或整批拒绝。"""
+
+    batch_id: str = Field(min_length=1, max_length=64)
+    items: list[ReassignmentItem] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _unique_segments(self):
+        ids = [it.segment_id for it in self.items]
+        if len(ids) != len(set(ids)):
+            raise ValueError("同批次内不得重复指定同一片段")
+        return self
+
+
+class SegmentRevisionBump(BaseModel):
+    segment_id: str
+    previous_revision: int
+    revision: int
+
+
+class DriverComplianceDelta(BaseModel):
+    driver_id: str
+    before: ComplianceResult
+    after: ComplianceResult
+
+
+class ReassignmentResponse(BaseModel):
+    batch_id: str
+    applied_at: datetime
+    segment_changes: list[SegmentRevisionBump]
+    drivers: list[DriverComplianceDelta]  # 受影响司机（源 ∪ 目标）调整前后的实时合规结论
+
+
 class InputRevision(BaseModel):
     segment_id: str
     revision: int
