@@ -30,6 +30,23 @@ class Segment(Base):
     )
 
 
+class ReassignmentBatch(Base):
+    """跨司机批量调整的批次记录：批次号唯一，固化首次提交的结果。
+
+    无论首次提交成功（status=2xx）还是被整批拒绝（status=4xx），都在此留痕：
+    同批次号同内容重放 -> 返回首次结果；同批次号异内容 -> 409 冲突。
+    """
+
+    __tablename__ = "reassignment_batches"
+
+    batch_id = Column(String(64), primary_key=True)
+    content_fingerprint = Column(String(64), nullable=False)
+    request_payload = Column(JSONType, nullable=False)  # 规范化后的批次内容
+    status_code = Column(Integer, nullable=False)  # 首次提交的 HTTP 状态码
+    response = Column(JSONType, nullable=False)  # 首次提交的响应体（成功/错误明细）
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class AuditSnapshot(Base):
     """审核发布快照：固化发布时刻的输入修订与合规结论，之后更正不影响旧版。"""
 

@@ -132,3 +132,63 @@ class CompareOut(BaseModel):
     current_result: dict[str, Any]
     results_differ: bool
     input_changes: InputChanges
+
+
+# ------------------------------------------------------------ 跨司机批量调整
+
+
+class ReassignmentItem(BaseModel):
+    """批次中的一条调整：每条片段的 ID、预期修订号、目标司机、起止时间和类型。"""
+
+    segment_id: str = Field(min_length=1, max_length=64)
+    expected_revision: int = Field(ge=1)
+    driver_id: str = Field(min_length=1, max_length=64)
+    start_utc: datetime
+    end_utc: datetime
+    type: SegmentType
+
+    @field_validator("start_utc", "end_utc")
+    @classmethod
+    def _tz(cls, v: datetime) -> datetime:
+        return _aware_utc(v)
+
+    @model_validator(mode="after")
+    def _positive_duration(self):
+        if self.end_utc <= self.start_utc:
+            raise ValueError("end_utc 必须晚于 start_utc（拒绝非正时长片段）")
+        return self
+
+
+class ReassignmentBatchCreate(BaseModel):
+    batch_id: str = Field(min_length=1, max_length=64)
+    items: list[ReassignmentItem] = Field(min_length=1)
+
+
+class ComplianceSummary(BaseModel):
+    """一次实时合规结论（不落库），结构与 GET .../compliance 一致。"""
+
+    evaluated_at: datetime
+    compliant: bool
+    violations: list[dict[str, Any]]
+
+
+class DriverReassignmentEffect(BaseModel):
+    driver_id: str
+    before: ComplianceSummary  # 本批调整前的实时合规结论
+    after: ComplianceSummary  # 本批调整后的实时合规结论
+
+
+class SegmentReassignmentChange(BaseModel):
+    segment_id: str
+    driver_id: str  # 调整后的所属司机
+    revision_before: int
+    revision_after: int  # 成功后每条修订号只加一
+
+
+class ReassignmentBatchOut(BaseModel):
+    batch_id: str
+    replayed: bool  # True 表示同批次号同内容重放，返回的是首次提交的结果
+    completed_at: datetime
+    affected_drivers: list[DriverReassignmentEffect]
+    segment_changes: list[SegmentReassignmentChange]
+    request_payload: list[dict[str, Any]]

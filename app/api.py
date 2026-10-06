@@ -3,15 +3,34 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from . import models, schemas
 from .compliance import Seg, evaluate_driver
 from .db import get_db
+from .reassignment import (
+    BatchRejection,
+    Move,
+    SegView,
+    canonical_payload,
+    ensure_unique_segment_refs,
+    final_layout,
+    payload_fingerprint,
+)
 
 router = APIRouter()
+
+# 写操作事务级咨询锁的固定键（64bit）。批量调整与单片段录入/更正共用，
+# 保证并发批次也不会绕过修订与重叠检查。仅 PostgreSQL 生效。
+# 键为字符串 "reassign" 各字节拼成的 64 位整数：72 65 61 73 73 69 67 6e
+_XACT_LOCK_KEY = 0x726561737369676E
+
+
+def _xact_lock(db: Session) -> None:
+    if db.bind is not None and db.bind.dialect.name == "postgresql":
+        db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _XACT_LOCK_KEY})
 
 
 # ---------------------------------------------------------------- 工具函数
@@ -108,6 +127,7 @@ def get_driver(driver_id: str, db: Session = Depends(get_db)):
 @router.post("/segments", response_model=schemas.SegmentOut, status_code=201, tags=["segments"])
 def create_segment(body: schemas.SegmentCreate, response: Response, db: Session = Depends(get_db)):
     """录入值勤片段。同 ID 同内容重试幂等；同 ID 异内容 409；重叠 409。"""
+    _xact_lock(db)
     existing = db.get(models.Segment, body.segment_id)
     if existing is not None:
         same = (
@@ -152,6 +172,7 @@ def get_segment(segment_id: str, db: Session = Depends(get_db)):
 @router.patch("/segments/{segment_id}", response_model=schemas.SegmentOut, tags=["segments"])
 def correct_segment(segment_id: str, body: schemas.SegmentPatch, db: Session = Depends(get_db)):
     """按片段 ID 与预期修订号更正；修订号不符拒绝（409）。"""
+    _xact_lock(db)
     seg = db.execute(
         select(models.Segment).where(models.Segment.segment_id == segment_id).with_for_update()
     ).scalars().first()
@@ -196,6 +217,232 @@ def correct_segment(segment_id: str, body: schemas.SegmentPatch, db: Session = D
 def list_driver_segments(driver_id: str, db: Session = Depends(get_db)):
     _get_driver_or_404(db, driver_id)
     return _driver_segments(db, driver_id)
+
+
+# ------------------------------------------------------------ 跨司机批量调整
+
+
+def _batch_error(exc: BatchRejection) -> HTTPException:
+    detail: dict = {
+        "error": exc.code,
+        "message": exc.message,
+        **exc.extra,
+    }
+    return HTTPException(status_code=exc.status_code, detail=detail)
+
+
+def _compliance_summary(db: Session, driver_id: str, evaluated_at: datetime) -> dict:
+    # evaluated_at 以 ISO 字符串落 JSON，与 violations 内的时间表示保持一致
+    return {
+        "evaluated_at": evaluated_at.astimezone(timezone.utc).isoformat(),
+        **_evaluate_current(db, driver_id),
+    }
+
+
+@router.post(
+    "/reassignment-batches",
+    response_model=schemas.ReassignmentBatchOut,
+    status_code=201,
+    tags=["reassignment-batches"],
+)
+def submit_reassignment_batch(
+    body: schemas.ReassignmentBatchCreate, response: Response, db: Session = Depends(get_db)
+):
+    """跨司机批量调整：把同一批已有片段作为一次原子操作提交。
+
+    - 每条携带片段 ID、预期修订号、目标司机、起止时间和类型；同批不得重复指定。
+    - 按所有调整完成后的**最终排布**检查各司机时间重叠：交换相接或互不重叠的
+      片段合法，且结论与提交顺序无关。
+    - 目标司机不存在、时间无效、片段缺失、修订号过期或最终排布重叠时整批拒绝，
+      不改任何记录。
+    - 成功后每条修订号只加一，返回受影响司机调整前后的实时合规结论与修订变化。
+    - 同批次号同内容重试返回首次提交结果（``replayed=true``）；异内容 409。
+    """
+    # 咨询锁串行化所有写操作：并发批次也必须逐个过修订与重叠检查
+    _xact_lock(db)
+
+    moves = [
+        Move(
+            segment_id=it.segment_id,
+            expected_revision=it.expected_revision,
+            driver_id=it.driver_id,
+            start=it.start_utc,
+            end=it.end_utc,
+            type=it.type.value,
+        )
+        for it in body.items
+    ]
+    ensure_unique_segment_refs(m.segment_id for m in moves)  # 形状校验外的二次防线
+    payload = canonical_payload(moves)
+    fingerprint = payload_fingerprint(payload)
+
+    prior = db.get(models.ReassignmentBatch, body.batch_id)
+    if prior is not None:
+        if prior.content_fingerprint != fingerprint:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "batch_content_conflict",
+                    "message": f"批次号 '{body.batch_id}' 已提交且内容不一致",
+                    "batch_id": body.batch_id,
+                },
+            )
+        if prior.status_code >= 400:
+            # 首次提交为整批拒绝：原样重放首次的拒绝结果
+            raise HTTPException(status_code=prior.status_code, detail=dict(prior.response))
+        response.status_code = 200
+        result = dict(prior.response)
+        result["replayed"] = True
+        return result
+
+    try:
+        result = _apply_reassignment_batch(db, body.batch_id, moves, payload, fingerprint)
+        # 首次成功：HTTP 201
+    except BatchRejection as exc:
+        # 首次提交被整批拒绝：固化错误结果，同内容重试可原样重放
+        error_body = {"error": exc.code, "message": exc.message, **exc.extra}
+        db.add(
+            models.ReassignmentBatch(
+                batch_id=body.batch_id,
+                content_fingerprint=fingerprint,
+                request_payload=payload,
+                status_code=exc.status_code,
+                response=error_body,
+            )
+        )
+        db.commit()
+        raise _batch_error(exc)
+
+    response.status_code = 201
+    return result
+
+
+def _apply_reassignment_batch(
+    db: Session,
+    batch_id: str,
+    moves: list[Move],
+    payload: list[dict],
+    fingerprint: str,
+) -> dict:
+    # 1. 锁定并核验每条被调整的片段：必须存在、修订号必须等于预期
+    ids = [m.segment_id for m in moves]
+    segs = list(
+        db.execute(
+            select(models.Segment)
+            .where(models.Segment.segment_id.in_(ids))
+            .with_for_update()
+        ).scalars()
+    )
+    by_id = {s.segment_id: s for s in segs}
+    for m in moves:
+        seg = by_id.get(m.segment_id)
+        if seg is None:
+            raise BatchRejection(
+                status_code=404,
+                code="segment_not_found",
+                message=f"片段 '{m.segment_id}' 不存在",
+                segment_id=m.segment_id,
+            )
+        if seg.revision != m.expected_revision:
+            raise BatchRejection(
+                status_code=409,
+                code="revision_conflict",
+                message="预期修订号与当前修订号不符，整批拒绝",
+                segment_id=m.segment_id,
+                current_revision=seg.revision,
+                expected_revision=m.expected_revision,
+            )
+
+    # 2. 目标司机必须全部存在
+    for driver_id in {m.driver_id for m in moves}:
+        if db.get(models.Driver, driver_id) is None:
+            raise BatchRejection(
+                status_code=404,
+                code="driver_not_found",
+                message=f"目标司机 '{driver_id}' 不存在",
+                driver_id=driver_id,
+            )
+
+    # 3. 受影响司机 = 被调整片段的当前所属司机 ∪ 目标司机
+    affected = sorted({s.driver_id for s in segs} | {m.driver_id for m in moves})
+
+    # 4. 调整前的实时合规结论（按现存记录重算）
+    evaluated_at = datetime.now(timezone.utc)
+    before = {d: _compliance_summary(db, d, evaluated_at) for d in affected}
+
+    # 5. 按所有调整完成后的最终排布检查各司机重叠（与提交顺序无关）
+    existing: list[SegView] = []
+    for d in affected:
+        existing.extend(
+            SegView(x.segment_id, x.driver_id, _utc(x.start_utc), _utc(x.end_utc), x.type)
+            for x in _driver_segments(db, d)
+        )
+    final_layout(existing, moves)
+
+    # 6. 应用调整：每条修订号只加一
+    for m in moves:
+        seg = by_id[m.segment_id]
+        seg.driver_id = m.driver_id
+        seg.start_utc = m.start
+        seg.end_utc = m.end
+        seg.type = m.type
+        seg.revision += 1
+
+    # 本会话 autoflush=False：显式 flush 使下面的“按现存记录重算”能读到最终排布
+    # （仍在同一事务内，未提交；随后失败可整体回滚）
+    db.flush()
+
+    # 7. 调整后的实时合规结论
+    after = {d: _compliance_summary(db, d, evaluated_at) for d in affected}
+
+    segment_changes = [
+        {
+            "segment_id": m.segment_id,
+            "driver_id": m.driver_id,
+            "revision_before": m.expected_revision,
+            "revision_after": m.expected_revision + 1,
+        }
+        for m in moves
+    ]
+    result = {
+        "batch_id": batch_id,
+        "replayed": False,
+        "completed_at": evaluated_at.astimezone(timezone.utc).isoformat(),
+        "affected_drivers": [
+            {"driver_id": d, "before": before[d], "after": after[d]} for d in affected
+        ],
+        "segment_changes": segment_changes,
+        "request_payload": payload,
+    }
+
+    # 8. 固化首次成功结果（与片段更新同一事务提交：全成功或全不改）
+    db.add(
+        models.ReassignmentBatch(
+            batch_id=batch_id,
+            content_fingerprint=fingerprint,
+            request_payload=payload,
+            status_code=201,
+            response=result,
+        )
+    )
+    db.commit()
+    return result
+
+
+@router.get(
+    "/reassignment-batches/{batch_id}",
+    response_model=schemas.ReassignmentBatchOut,
+    tags=["reassignment-batches"],
+)
+def get_reassignment_batch(batch_id: str, db: Session = Depends(get_db)):
+    """查看批次首次提交的结果（成功结论；被拒绝的批次同样可查，返回 4xx 体）。"""
+    batch = db.get(models.ReassignmentBatch, batch_id)
+    if batch is None:
+        raise HTTPException(status_code=404, detail=f"批次 '{batch_id}' 不存在")
+    if batch.status_code >= 400:
+        # 首次提交为整批拒绝：重放当时的错误结论
+        raise HTTPException(status_code=batch.status_code, detail=dict(batch.response))
+    return batch.response
 
 
 # ---------------------------------------------------------------- 合规查询

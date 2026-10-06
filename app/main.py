@@ -31,8 +31,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="铁路司机值勤合规核算服务",
-    version="1.0.0",
-    description="司机值勤片段录入/更正、滚动 24h 值勤上限与累计驾驶上限核算、审核发布与历史对照",
+    version="1.1.0",
+    description=(
+        "司机值勤片段录入/更正、滚动 24h 值勤上限与累计驾驶上限核算、"
+        "跨司机值勤批量调整（批次原子提交）、审核发布与历史对照"
+    ),
     lifespan=lifespan,
 )
 app.include_router(router)

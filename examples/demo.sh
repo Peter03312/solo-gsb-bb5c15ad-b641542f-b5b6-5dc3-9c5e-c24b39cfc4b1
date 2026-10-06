@@ -72,3 +72,62 @@ req GET /drivers/DRV-1001/audits
 
 echo "########## 10. 对照历史版本 1 与当前结果"
 req GET /drivers/DRV-1001/audits/1/compare
+
+echo "########## 11. 跨司机批量调整：录入第二名司机与两条相接片段（不同司机、同一天空闲日）"
+req POST /drivers '{"driver_id":"DRV-2002","name":"李四"}'
+req POST /segments '{"segment_id":"SEG-SW1","driver_id":"DRV-1001","start_utc":"2026-10-07T08:00:00Z","end_utc":"2026-10-07T10:00:00Z","type":"DRIVING"}'
+req POST /segments '{"segment_id":"SEG-SW2","driver_id":"DRV-2002","start_utc":"2026-10-07T10:00:00Z","end_utc":"2026-10-07T12:00:00Z","type":"DRIVING"}'
+
+echo "########## 12. 一批内互换两条相接片段（按最终排布检查，与提交顺序无关；两条修订号各 +1）"
+req POST /reassignment-batches '{
+  "batch_id":"BATCH-SWAP-01",
+  "items":[
+    {"segment_id":"SEG-SW1","expected_revision":1,"driver_id":"DRV-2002",
+     "start_utc":"2026-10-07T08:00:00Z","end_utc":"2026-10-07T10:00:00Z","type":"DRIVING"},
+    {"segment_id":"SEG-SW2","expected_revision":1,"driver_id":"DRV-1001",
+     "start_utc":"2026-10-07T10:00:00Z","end_utc":"2026-10-07T12:00:00Z","type":"DRIVING"}
+  ]
+}'
+# 期望：201，affected_drivers 两名司机调整前后合规结论，segment_changes 两条均 1 -> 2
+
+echo "########## 13. 同批次号同内容重试 -> 200 replayed=true，修订号不再增加"
+req POST /reassignment-batches '{
+  "batch_id":"BATCH-SWAP-01",
+  "items":[
+    {"segment_id":"SEG-SW1","expected_revision":1,"driver_id":"DRV-2002",
+     "start_utc":"2026-10-07T08:00:00Z","end_utc":"2026-10-07T10:00:00Z","type":"DRIVING"},
+    {"segment_id":"SEG-SW2","expected_revision":1,"driver_id":"DRV-1001",
+     "start_utc":"2026-10-07T10:00:00Z","end_utc":"2026-10-07T12:00:00Z","type":"DRIVING"}
+  ]
+}'
+
+echo "########## 14. 同批次号异内容 -> 409 batch_content_conflict"
+req POST /reassignment-batches '{
+  "batch_id":"BATCH-SWAP-01",
+  "items":[
+    {"segment_id":"SEG-SW1","expected_revision":2,"driver_id":"DRV-2002",
+     "start_utc":"2026-10-07T09:00:00Z","end_utc":"2026-10-07T10:00:00Z","type":"DRIVING"}
+  ]
+}'
+
+echo "########## 15. 最终排布重叠 -> 409 segment_overlap，整批拒绝不改任何记录"
+req POST /reassignment-batches '{
+  "batch_id":"BATCH-BAD-01",
+  "items":[
+    {"segment_id":"SEG-SW1","expected_revision":2,"driver_id":"DRV-1001",
+     "start_utc":"2026-10-05T09:00:00Z","end_utc":"2026-10-05T09:30:00Z","type":"DRIVING"}
+  ]
+}'
+# 期望：segment_overlap（与 DRV-1001 当天 08:00-10:00 的 SEG-A 重叠；相接合法、重叠非法）
+
+echo "########## 16. 修订号过期 -> 409 revision_conflict（整批拒绝；SEG-SW2 当前已是修订号 2）"
+req POST /reassignment-batches '{
+  "batch_id":"BATCH-STALE-01",
+  "items":[
+    {"segment_id":"SEG-SW2","expected_revision":1,"driver_id":"DRV-1001",
+     "start_utc":"2026-10-05T08:00:00Z","end_utc":"2026-10-05T09:00:00Z","type":"DRIVING"}
+  ]
+}'
+
+echo "########## 17. 查询批次首次提交结果"
+req GET /reassignment-batches/BATCH-SWAP-01
